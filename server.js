@@ -27,8 +27,37 @@ try {
   const app = express();
 
   // Middleware
+  // Permitir múltiples orígenes en CORS
+  const allowedOrigins = [
+    'http://localhost:5173',
+    'https://guidergy.com',
+    'http://guidergy.com',
+    'https://backendguidergy-production.up.railway.app',
+    'http://backendguidergy-production.up.railway.app'
+  ];
   app.use(cors({
-    origin: 'http://localhost:5173',
+    origin: function (origin, callback) {
+      // Permitir peticiones sin origen (como Postman o curl)
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      } else {
+        return callback(new Error('Not allowed by CORS'), false);
+      }
+    },
+    credentials: true
+  }));
+
+  // Evitar redirecciones en OPTIONS
+  app.options('*', cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      } else {
+        return callback(new Error('Not allowed by CORS'), false);
+      }
+    },
     credentials: true
   }));
   app.use(express.json());
