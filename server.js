@@ -27,7 +27,10 @@ try {
   const app = express();
 
   // Middleware
-  app.use(cors());
+  app.use(cors({
+    origin: 'http://localhost:5173',
+    credentials: true
+  }));
   app.use(express.json());
 
   // Security middleware
@@ -94,7 +97,7 @@ try {
   });
 
   // Configuración de JWT
-  const JWT_SECRET = process.env.JWT_SECRET || 'tu-secreto-seguro-aqui';
+  const JWT_SECRET = process.env.JWT_SECRET
   const JWT_EXPIRES_IN = '24h';
 
   // Middleware para verificar el token JWT
@@ -114,6 +117,24 @@ try {
       next();
     });
   };
+
+  // Endpoint para obtener todas las comercializadoras
+  app.get('/api/comercializadoras', authenticateToken, async (req, res) => {
+    try {
+      const [comercializadoras] = await pool.promise().query('SELECT id_comercializadora, nombre FROM comercializadora');
+      res.json({
+        status: 'success',
+        data: comercializadoras
+      });
+    } catch (error) {
+      console.error('Error al obtener comercializadoras:', error);
+      res.status(500).json({
+        status: 'error',
+        message: 'Error al obtener las comercializadoras',
+        error: error.message
+      });
+    }
+  });
 
   // Ruta para registrar una nueva comercializadora
   app.post('/api/register/comercializadora', authenticateToken, async (req, res) => {
@@ -243,6 +264,95 @@ try {
     }
   });
 
+  // Endpoint para registrar un usuario básico (solo administradores)
+  app.post('/api/register/usuario-basico', authenticateToken, async (req, res) => {
+    try {
+      if (req.user.role !== 'administrador') {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Solo los administradores pueden registrar usuarios básicos'
+        });
+      }
+      const {
+        titular,
+        telefono,
+        nif_cif,
+        email,
+        direccion,
+        cp,
+        localidad,
+        provincia,
+        username,
+        password,
+        margen
+      } = req.body;
+      if (!titular || !telefono || !nif_cif || !email || !direccion || !cp || !localidad || !provincia || !username || !password || margen === undefined) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Todos los campos son obligatorios'
+        });
+      }
+      // Verificar si el username, email o nif_cif ya existen
+      const [existing] = await pool.promise().query(
+        'SELECT * FROM usuario_basico WHERE username = ? OR email = ? OR nif_cif = ?',
+        [username, email, nif_cif]
+      );
+      if (existing.length > 0) {
+        return res.status(409).json({
+          status: 'error',
+          message: 'Ya existe un usuario básico con ese username, email o NIF/CIF'
+        });
+      }
+      // Verificar el límite de usuarios básicos para el administrador
+      const [[adminData]] = await pool.promise().query(
+        'SELECT numUsers FROM administrador WHERE id_administrador = ?',
+        [req.user.id]
+      );
+      const [usuariosActuales] = await pool.promise().query(
+        'SELECT COUNT(*) AS total FROM usuario_basico WHERE id_administrador = ?',
+        [req.user.id]
+      );
+      if (usuariosActuales[0].total >= adminData.numUsers) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Has alcanzado el número máximo de usuarios básicos permitidos para este administrador'
+        });
+      }
+      // Hashear la contraseña
+      const hashedPassword = await bcrypt.hash(password, 10);
+      // Insertar el usuario básico
+      const [result] = await pool.promise().query(
+        `INSERT INTO usuario_basico (titular, telefono, nif_cif, email, direccion, cp, localidad, provincia, username, password, margen, id_administrador)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [titular, telefono, nif_cif, email, direccion, cp, localidad, provincia, username, hashedPassword, margen, req.user.id]
+      );
+      res.status(201).json({
+        status: 'success',
+        message: 'Usuario básico registrado correctamente',
+        data: {
+          id_usuario_basico: result.insertId,
+          titular,
+          telefono,
+          nif_cif,
+          email,
+          direccion,
+          cp,
+          localidad,
+          provincia,
+          username,
+          margen
+        }
+      });
+    } catch (error) {
+      console.error('Error al registrar usuario básico:', error);
+      res.status(500).json({
+        status: 'error',
+        message: 'Error al registrar usuario básico',
+        error: error.message
+      });
+    }
+  });
+
   // Route to login
   app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
@@ -299,7 +409,9 @@ try {
       // Verificar en usuario_basico
       if (!user && usuariosBasicos.length > 0) {
         const usuarioBasico = usuariosBasicos[0];
+        console.log('[LOGIN] Usuario básico encontrado:', usuarioBasico.username);
         const isValidPassword = await bcrypt.compare(password, usuarioBasico.password);
+        console.log('[LOGIN] ¿Password válida usuario básico?', isValidPassword);
         if (isValidPassword) {
           user = usuarioBasico;
           role = 'usuario_basico';
@@ -313,10 +425,18 @@ try {
         });
       }
 
-      // Crear token JWT
+      // Crear token JWT con el id correcto según el rol
+      let userId;
+      if (role === 'maestro') {
+        userId = user.id_maestro;
+      } else if (role === 'administrador') {
+        userId = user.id_administrador;
+      } else if (role === 'usuario_basico') {
+        userId = user.id_usuario_basico;
+      }
       const token = jwt.sign(
         { 
-          id: user.id_maestro || user.id_administrador || user.id_usuario_basico,
+          id: userId,
           username: user.username,
           role: role
         },
@@ -327,19 +447,28 @@ try {
       // Eliminar la contraseña del objeto de respuesta
       delete user.password;
 
+      // Construir el objeto user con el id correcto según el rol
+      let userData = {
+        nombre: user.nombre || user.titular,
+        apellidos: user.apellidos || '',
+        username: user.username,
+        email: user.email,
+        role: role
+      };
+      if (role === 'maestro') {
+        userData.id = user.id_maestro;
+      } else if (role === 'administrador') {
+        userData.id = user.id_administrador;
+      } else if (role === 'usuario_basico') {
+        userData.id = user.id_usuario_basico;
+      }
+
       res.status(200).json({
         status: 'success',
         message: 'Login exitoso',
         data: {
           token,
-          user: {
-            id: user.id_maestro || user.id_administrador || user.id_usuario_basico,
-            nombre: user.nombre || user.titular,
-            apellidos: user.apellidos || '',
-            username: user.username,
-            email: user.email,
-            role: role
-          }
+          user: userData
         }
       });
     } catch (error) {
@@ -353,12 +482,30 @@ try {
   });
 
   // Ruta protegida de ejemplo
+  // Ruta protegida para obtener el perfil según el rol
   app.get('/api/user/profile', authenticateToken, async (req, res) => {
     try {
-      const [users] = await pool.promise().query(
-        'SELECT id_maestro, nombre, apellidos, username, email FROM maestro WHERE id_maestro = ?',
-        [req.user.id]
-      );
+      let userProfile = null;
+      let query = '';
+      let params = [];
+
+      if (req.user.role === 'maestro') {
+        query = 'SELECT id_maestro AS id, nombre, apellidos, username, email, "maestro" AS role FROM maestro WHERE id_maestro = ?';
+        params = [req.user.id];
+      } else if (req.user.role === 'administrador') {
+        query = 'SELECT id_administrador AS id, titular AS nombre, "" AS apellidos, username, email, "administrador" AS role FROM administrador WHERE id_administrador = ?';
+        params = [req.user.id];
+      } else if (req.user.role === 'usuario_basico') {
+        query = 'SELECT id_usuario_basico AS id, titular AS nombre, "" AS apellidos, username, email, "usuario_basico" AS role FROM usuario_basico WHERE id_usuario_basico = ?';
+        params = [req.user.id];
+      } else {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Rol de usuario no reconocido'
+        });
+      }
+
+      const [users] = await pool.promise().query(query, params);
 
       if (users.length === 0) {
         return res.status(404).json({
@@ -367,9 +514,10 @@ try {
         });
       }
 
+      userProfile = users[0];
       res.status(200).json({
         status: 'success',
-        data: users[0]
+        data: userProfile
       });
     } catch (error) {
       res.status(500).json({
@@ -394,13 +542,12 @@ try {
         provincia, 
         username, 
         password, 
-        margen,
         id_comercializadora 
       } = req.body;
 
       // Validar campos requeridos
       if (!titular || !telefono || !nif_cif || !email || !direccion || !cp || 
-          !localidad || !provincia || !username || !password || !margen || !id_comercializadora) {
+          !localidad || !provincia || !username || !password || !id_comercializadora) {
         return res.status(400).json({ 
           status: 'error',
           message: 'Todos los campos son requeridos'
@@ -453,11 +600,11 @@ try {
         const [result] = await connection.query(
           `INSERT INTO administrador (
             titular, telefono, nif_cif, email, direccion, cp, 
-            localidad, provincia, username, password, margen, id_maestro
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            localidad, provincia, username, password, id_maestro
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             titular, telefono, nif_cif, email, direccion, cp,
-            localidad, provincia, username, hashedPassword, margen, req.user.id
+            localidad, provincia, username, hashedPassword, req.user.id
           ]
         );
 
@@ -495,34 +642,6 @@ try {
     }
   });
 
-  // Ruta para obtener las comercializadoras
-  app.get('/api/comercializadoras', authenticateToken, async (req, res) => {
-    try {
-      // Verificar si el usuario es maestro
-      if (req.user.role !== 'maestro') {
-        return res.status(403).json({
-          status: 'error',
-          message: 'Solo los maestros pueden ver las comercializadoras'
-        });
-      }
-
-      const [comercializadoras] = await pool.promise().query(
-        'SELECT id_comercializadora, nombre FROM comercializadora WHERE id_maestro = ?',
-        [req.user.id]
-      );
-
-      res.json({
-        status: 'success',
-        data: comercializadoras
-      });
-    } catch (error) {
-      console.error('Error al obtener comercializadoras:', error);
-      res.status(500).json({
-        status: 'error',
-        message: 'Error al obtener las comercializadoras'
-      });
-    }
-  });
 
   // Endpoint para verificar si un usuario es maestro
   app.get('/api/auth/check-maestro', authenticateToken, async (req, res) => {
@@ -554,6 +673,301 @@ try {
       res.status(500).json({ message: 'Error al verificar si es administrador' });
     }
   });
+
+  // Endpoint para obtener todos los administradores
+  app.get('/api/administradores', async (req, res) => {
+    try {
+      // Solo permitir a usuarios con rol maestro
+      if (req.user && req.user.role !== 'maestro') {
+        return res.status(403).json({
+          status: 'error',
+          message: 'No autorizado para ver administradores'
+        });
+      }
+      // Obtener todos los administradores
+      const [admins] = await pool.promise().query(
+        'SELECT id_administrador, titular, telefono, nif_cif, email, direccion, cp, localidad, numusers, provincia, username FROM administrador'
+      );
+
+      // Para cada admin, obtener el número real de usuarios asociados
+      const adminIds = admins.map(a => a.id_administrador);
+      let usuariosPorAdmin = {};
+      if (adminIds.length > 0) {
+        const [userCounts] = await pool.promise().query(
+          'SELECT id_administrador, COUNT(*) as usuarios_actuales FROM usuario_basico WHERE id_administrador IN (?) GROUP BY id_administrador',
+          [adminIds]
+        );
+        userCounts.forEach(row => {
+          usuariosPorAdmin[row.id_administrador] = row.usuarios_actuales;
+        });
+      }
+      // Añadir campo usuarios_actuales a cada admin
+      admins.forEach(admin => {
+        admin.usuarios_actuales = usuariosPorAdmin[admin.id_administrador] || 0;
+      });
+
+      res.json({
+        status: 'success',
+        data: admins
+      });
+    } catch (error) {
+      console.error('Error al obtener administradores:', error);
+      res.status(500).json({
+        status: 'error',
+        message: 'Error al obtener los administradores'
+      });
+    }
+  });
+
+  // Endpoint para obtener usuarios básicos por id de administrador
+  app.get('/api/users/:idAdmin', authenticateToken, async (req, res) => {
+    try {
+      const idAdmin = req.params.idAdmin;
+      console.log('[USERS-BY-ADMIN] idAdmin:', idAdmin);
+      console.log('[USERS-BY-ADMIN] req.user:', req.user);
+      // Solo permitir a usuarios con rol maestro o el propio administrador
+      console.log('[REGISTER-USUARIO-BASICO] req.user:', req.user);
+      if (!req.user || (req.user.role !== 'maestro' && !(req.user.role === 'administrador' && req.user.id == idAdmin))) {
+        console.warn('[USERS-BY-ADMIN] No autorizado', { user: req.user, idAdmin });
+        return res.status(403).json({
+          status: 'error',
+          message: 'No autorizado para ver los usuarios básicos de este administrador'
+        });
+      }
+      const [usuarios] = await pool.promise().query(
+        'SELECT id_usuario, titular, telefono, nif_cif, email, direccion, cp, localidad, provincia, username, margen, id_administrador FROM usuario_basico WHERE id_administrador = ?',
+        [idAdmin]
+      );
+      console.log('[USERS-BY-ADMIN] usuarios encontrados:', usuarios);
+      res.json({
+        status: 'success',
+        data: usuarios
+      });
+    } catch (error) {
+      console.error('[USERS-BY-ADMIN] Error al obtener usuarios básicos por administrador:', error);
+      if (error && error.stack) {
+        console.error('[USERS-BY-ADMIN] Stack:', error.stack);
+      }
+      res.status(500).json({
+        status: 'error',
+        message: 'Error al obtener los usuarios básicos de este administrador',
+        error: error && error.message ? error.message : error
+      });
+    }
+  });
+
+  // Endpoint para eliminar un administrador (solo rol maestro)
+  app.delete('/api/administrador/:id', authenticateToken, async (req, res) => {
+    try {
+      if (!req.user || req.user.role !== 'maestro') {
+        return res.status(403).json({
+          status: 'error',
+          message: 'No autorizado para eliminar administradores'
+        });
+      }
+      const id = req.params.id;
+      // Eliminar administrador y relaciones asociadas (si aplica)
+      // Primero eliminar relaciones en administrador_comercializadora
+      await pool.promise().query('DELETE FROM administrador_comercializadora WHERE id_administrador = ?', [id]);
+      // Eliminar usuarios básicos asociados
+      await pool.promise().query('DELETE FROM usuario_basico WHERE id_administrador = ?', [id]);
+      // Eliminar tarifas consultoría asociadas
+      await pool.promise().query('DELETE FROM tarifa_consultoria WHERE id_administrador = ?', [id]);
+      // Finalmente, eliminar el administrador
+      const [result] = await pool.promise().query('DELETE FROM administrador WHERE id_administrador = ?', [id]);
+      if (result.affectedRows === 0) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Administrador no encontrado'
+        });
+      }
+      res.json({
+        status: 'success',
+        message: 'Administrador eliminado correctamente'
+      });
+    } catch (error) {
+      console.error('Error al eliminar administrador:', error);
+      res.status(500).json({
+        status: 'error',
+        message: 'Error al eliminar el administrador',
+        error: error.message
+      });
+    }
+  });
+
+  // Endpoint para obtener los usuarios básicos de un administrador
+  app.get('/api/administrador/:id/usuarios-basicos', authenticateToken, async (req, res) => {
+    try {
+      const idAdmin = req.params.id;
+      // Solo el propio admin o un rol superior puede consultar
+      if (!req.user || (req.user.role !== 'administrador' && req.user.role !== 'maestro')) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'No autorizado para consultar los usuarios básicos de este administrador'
+        });
+      }
+      // Si es admin, solo puede consultar los suyos
+      if (req.user.role === 'administrador' && req.user.id != idAdmin) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'No autorizado para consultar los usuarios de otro administrador'
+        });
+      }
+      const [usuarios] = await pool.promise().query(
+        'SELECT * FROM usuario_basico WHERE id_administrador = ?',
+        [idAdmin]
+      );
+      res.json({
+        status: 'success',
+        data: usuarios
+      });
+    } catch (error) {
+      console.error('Error al obtener usuarios básicos del administrador:', error);
+      res.status(500).json({
+        status: 'error',
+        message: 'Error al obtener usuarios básicos del administrador',
+        error: error.message
+      });
+    }
+  });
+
+  // Endpoint para editar un usuario básico
+  app.put('/api/usuario-basico/:id', authenticateToken, async (req, res) => {
+    try {
+      const id = req.params.id;
+      // Solo admin dueño o maestro puede editar
+      const [[usuario]] = await pool.promise().query('SELECT id_administrador FROM usuario_basico WHERE id_usuario = ?', [id]);
+      if (!usuario) {
+        return res.status(404).json({ status: 'error', message: 'Usuario básico no encontrado' });
+      }
+      if (
+        req.user.role !== 'maestro' &&
+        !(req.user.role === 'administrador' && req.user.id == usuario.id_administrador)
+      ) {
+        return res.status(403).json({ status: 'error', message: 'No autorizado para editar este usuario básico' });
+      }
+      // Campos editables
+      const allowedFields = [
+        'titular','telefono','nif_cif','email','direccion','cp','localidad','provincia','username','margen'
+      ];
+      const updates = {};
+      for (const field of allowedFields) {
+        if (Object.prototype.hasOwnProperty.call(req.body, field)) {
+          updates[field] = req.body[field];
+        }
+      }
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ status: 'error', message: 'No hay campos válidos para actualizar' });
+      }
+      const setClause = Object.keys(updates).map(field => `${field} = ?`).join(', ');
+      const values = Object.values(updates);
+      values.push(id);
+      const [result] = await pool.promise().query(
+        `UPDATE usuario_basico SET ${setClause} WHERE id_usuario = ?`,
+        values
+      );
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ status: 'error', message: 'Usuario básico no encontrado' });
+      }
+      res.json({ status: 'success', message: 'Usuario básico actualizado correctamente' });
+    } catch (error) {
+      console.error('Error al editar usuario básico:', error);
+      res.status(500).json({ status: 'error', message: 'Error al editar usuario básico', error: error.message });
+    }
+  });
+
+  // Endpoint para eliminar un usuario básico
+  app.delete('/api/usuario-basico/:id', authenticateToken, async (req, res) => {
+    try {
+      const id = req.params.id;
+      // Solo admin dueño o maestro puede eliminar
+      const [[usuario]] = await pool.promise().query('SELECT id_administrador FROM usuario_basico WHERE id_usuario = ?', [id]);
+      if (!usuario) {
+        return res.status(404).json({ status: 'error', message: 'Usuario básico no encontrado' });
+      }
+      if (
+        req.user.role !== 'maestro' &&
+        !(req.user.role === 'administrador' && req.user.id == usuario.id_administrador)
+      ) {
+        return res.status(403).json({ status: 'error', message: 'No autorizado para eliminar este usuario básico' });
+      }
+      const [result] = await pool.promise().query('DELETE FROM usuario_basico WHERE id_usuario = ?', [id]);
+      if (result.affectedRows === 0) {
+        return res.status(404).json({ status: 'error', message: 'Usuario básico no encontrado' });
+      }
+      res.json({ status: 'success', message: 'Usuario básico eliminado correctamente' });
+    } catch (error) {
+      console.error('Error al eliminar usuario básico:', error);
+      res.status(500).json({ status: 'error', message: 'Error al eliminar usuario básico', error: error.message });
+    }
+  });
+
+
+  // Endpoint para actualizar un administrador (excepto id y password)
+  app.put('/api/administrador/:id', authenticateToken, async (req, res) => {
+    try {
+      // Solo permitir a usuarios con rol maestro
+      if (!req.user || req.user.role !== 'maestro') {
+        return res.status(403).json({
+          status: 'error',
+          message: 'No autorizado para actualizar administradores'
+        });
+      }
+      const id = req.params.id;
+      // Campos permitidos para actualizar
+      const allowedFields = [
+        'titular',
+        'telefono',
+        'nif_cif',
+        'email',
+        'direccion',
+        'cp',
+        'localidad',
+        'provincia',
+        'username'
+      ];
+      // Construir el objeto de actualización excluyendo id y password
+      const updates = {};
+      for (const field of allowedFields) {
+        if (Object.prototype.hasOwnProperty.call(req.body, field)) {
+          updates[field] = req.body[field];
+        }
+      }
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'No hay campos válidos para actualizar'
+        });
+      }
+      // Construir consulta dinámica
+      const setClause = Object.keys(updates).map(field => `${field} = ?`).join(', ');
+      const values = Object.values(updates);
+      values.push(id);
+      const [result] = await pool.promise().query(
+        `UPDATE administrador SET ${setClause} WHERE id_administrador = ?`,
+        values
+      );
+      if (result.affectedRows === 0) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Administrador no encontrado'
+        });
+      }
+      res.json({
+        status: 'success',
+        message: 'Administrador actualizado correctamente'
+      });
+    } catch (error) {
+      console.error('Error al actualizar administrador:', error);
+      res.status(500).json({
+        status: 'error',
+        message: 'Error al actualizar el administrador',
+        error: error.message
+      });
+    }
+  });
+
+  // Endpoint para obtener administradores con sus usuarios básicos asociado
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
